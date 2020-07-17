@@ -2,6 +2,7 @@
 #include "skynet_mq.h"
 #include "skynet_handle.h"
 #include "spinlock.h"
+#include "skynet_thread.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,7 +39,13 @@ struct global_queue {
 	struct spinlock lock;
 };
 
+struct multi_queue {
+	struct message_queue **queue;
+	int size;
+};
+
 static struct global_queue *Q = NULL;
+static struct multi_queue MQ;
 
 void 
 skynet_globalmq_push(struct message_queue * queue) {
@@ -137,7 +144,6 @@ skynet_mq_overload(struct message_queue *q) {
 int
 skynet_mq_pop(struct message_queue *q, struct skynet_message *message) {
 	int ret = 1;
-	SPIN_LOCK(q)
 
 	if (q->head != q->tail) {
 		*message = q->queue[q->head++];
@@ -166,8 +172,6 @@ skynet_mq_pop(struct message_queue *q, struct skynet_message *message) {
 		q->in_global = 0;
 	}
 	
-	SPIN_UNLOCK(q)
-
 	return ret;
 }
 
@@ -189,7 +193,6 @@ expand_queue(struct message_queue *q) {
 void 
 skynet_mq_push(struct message_queue *q, struct skynet_message *message) {
 	assert(message);
-	SPIN_LOCK(q)
 
 	q->queue[q->tail] = *message;
 	if (++ q->tail >= q->cap) {
@@ -199,13 +202,6 @@ skynet_mq_push(struct message_queue *q, struct skynet_message *message) {
 	if (q->head == q->tail) {
 		expand_queue(q);
 	}
-
-	if (q->in_global == 0) {
-		q->in_global = MQ_IN_GLOBAL;
-		skynet_globalmq_push(q);
-	}
-	
-	SPIN_UNLOCK(q)
 }
 
 void 
@@ -247,4 +243,37 @@ skynet_mq_release(struct message_queue *q, message_drop drop_func, void *ud) {
 		skynet_globalmq_push(q);
 		SPIN_UNLOCK(q)
 	}
+}
+
+void
+skynet_multi_queue_init(int num) {
+	int i, size;
+	assert(num > 0);
+
+	size = num * num;
+	MQ.queue = (struct message_queue **)skynet_malloc(size * sizeof(struct message_queue *));
+	for (i = 0; i < size; ++i) {
+		*(MQ.queue + i) = skynet_mq_create(0);
+	}
+	MQ.size = num;
+}
+
+int
+skynet_multi_queue_size() {
+	return MQ.size;
+}
+
+void
+skynet_multi_queue_push(int row, int col, struct skynet_message* msg) {
+	struct message_queue *q = MQ.queue[row * MQ.size + col];
+	skynet_mq_push(q, msg);
+	if (skynet_thread_idle(col)) {
+		skynet_thread_signal(col);
+	}
+}
+
+int
+skynet_multi_queue_pop(int row, int col, struct skynet_message* msg) {
+	struct message_queue *q = MQ.queue[row * MQ.size + col];
+	return skynet_mq_pop(q, msg);
 }

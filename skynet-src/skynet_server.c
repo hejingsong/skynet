@@ -51,6 +51,7 @@ struct skynet_context {
 	uint64_t cpu_start;	// in microsec
 	char result[32];
 	uint32_t handle;
+	uint32_t qid;	// queue id
 	int session_id;
 	int ref;
 	int message_count;
@@ -66,6 +67,7 @@ struct skynet_node {
 	int init;
 	uint32_t monitor_exit;
 	pthread_key_t handle_key;
+	pthread_key_t thread_id;
 	bool profile;	// default is off
 };
 
@@ -132,6 +134,7 @@ skynet_context_new(const char * name, const char *param) {
 	void *inst = skynet_module_instance_create(mod);
 	if (inst == NULL)
 		return NULL;
+	int queue_size = skynet_multi_queue_size() - WORKER_THREAD_ID_OFFSET;
 	struct skynet_context * ctx = skynet_malloc(sizeof(*ctx));
 	CHECKCALLING_INIT(ctx)
 
@@ -143,7 +146,7 @@ skynet_context_new(const char * name, const char *param) {
 	ctx->session_id = 0;
 	ctx->logfile = NULL;
 
-	ctx->init = false;
+	ctx->init = true;
 	ctx->endless = false;
 
 	ctx->cpu_cost = 0;
@@ -153,7 +156,8 @@ skynet_context_new(const char * name, const char *param) {
 	// Should set to 0 first to avoid skynet_handle_retireall get an uninitialized handle
 	ctx->handle = 0;	
 	ctx->handle = skynet_handle_register(ctx);
-	struct message_queue * queue = ctx->queue = skynet_mq_create(ctx->handle);
+	ctx->qid = (skynet_context_total() % queue_size) + WORKER_THREAD_ID_OFFSET;
+	struct message_queue * queue = ctx->queue = NULL; // skynet_mq_create(ctx->handle);
 	// init function maybe use ctx->handle, so it must init at last
 	context_inc();
 
@@ -163,14 +167,11 @@ skynet_context_new(const char * name, const char *param) {
 	if (r == 0) {
 		struct skynet_context * ret = skynet_context_release(ctx);
 		if (ret) {
-			ctx->init = true;
-		}
-		skynet_globalmq_push(queue);
-		if (ret) {
 			skynet_error(ret, "LAUNCH %s %s", name, param ? param : "");
 		}
 		return ret;
 	} else {
+		ctx->init = false;
 		skynet_error(ctx, "FAILED launch %s", name);
 		uint32_t handle = ctx->handle;
 		skynet_context_release(ctx);
@@ -211,7 +212,7 @@ delete_context(struct skynet_context *ctx) {
 		fclose(ctx->logfile);
 	}
 	skynet_module_instance_release(ctx->mod, ctx->instance);
-	skynet_mq_mark_release(ctx->queue);
+	// skynet_mq_mark_release(ctx->queue);
 	CHECKCALLING_DESTROY(ctx)
 	skynet_free(ctx);
 	context_dec();
@@ -228,11 +229,14 @@ skynet_context_release(struct skynet_context *ctx) {
 
 int
 skynet_context_push(uint32_t handle, struct skynet_message *message) {
+	int qid;
 	struct skynet_context * ctx = skynet_handle_grab(handle);
 	if (ctx == NULL) {
 		return -1;
 	}
-	skynet_mq_push(ctx->queue, message);
+	message->dest = handle;
+	qid = skynet_thread_id();
+	skynet_multi_queue_push(qid, ctx->qid, message);
 	skynet_context_release(ctx);
 
 	return 0;
@@ -293,61 +297,35 @@ skynet_context_dispatchall(struct skynet_context * ctx) {
 	}
 }
 
-struct message_queue * 
-skynet_context_message_dispatch(struct skynet_monitor *sm, struct message_queue *q, int weight) {
-	if (q == NULL) {
-		q = skynet_globalmq_pop();
-		if (q==NULL)
-			return NULL;
-	}
-
-	uint32_t handle = skynet_mq_handle(q);
-
-	struct skynet_context * ctx = skynet_handle_grab(handle);
-	if (ctx == NULL) {
-		struct drop_t d = { handle };
-		skynet_mq_release(q, drop_message, &d);
-		return skynet_globalmq_pop();
-	}
-
-	int i,n=1;
+int
+skynet_context_message_dispatch(struct skynet_monitor *sm, int id) {
+	int i, ret = 0;
+	int queue_size = skynet_multi_queue_size();
+	struct skynet_context *ctx;
 	struct skynet_message msg;
 
-	for (i=0;i<n;i++) {
-		if (skynet_mq_pop(q,&msg)) {
-			skynet_context_release(ctx);
-			return skynet_globalmq_pop();
-		} else if (i==0 && weight >= 0) {
-			n = skynet_mq_length(q);
-			n >>= weight;
+	for (i = 0; i < queue_size; ++i) {
+		if (skynet_multi_queue_pop(i, id, &msg)) {
+			continue;
 		}
-		int overload = skynet_mq_overload(q);
-		if (overload) {
-			skynet_error(ctx, "May overload, message queue length = %d", overload);
+		ctx = skynet_handle_grab(msg.dest);
+		if (NULL == ctx) {
+			continue;
 		}
 
-		skynet_monitor_trigger(sm, msg.source , handle);
-
+		skynet_monitor_trigger(sm, msg.source , msg.dest);
 		if (ctx->cb == NULL) {
 			skynet_free(msg.data);
 		} else {
 			dispatch_message(ctx, &msg);
 		}
-
 		skynet_monitor_trigger(sm, 0,0);
+		skynet_context_release(ctx);
+
+		ret++;
 	}
 
-	assert(q == ctx->queue);
-	struct message_queue *nq = skynet_globalmq_pop();
-	if (nq) {
-		// If global mq is not empty , push q back, and return next queue (nq)
-		// Else (global mq is empty or block, don't push q back, and return q again (for next dispatch)
-		skynet_globalmq_push(q);
-		q = nq;
-	} 
-	skynet_context_release(ctx);
-
-	return q;
+	return ret;
 }
 
 static void
@@ -801,7 +779,7 @@ skynet_context_send(struct skynet_context * ctx, void * msg, size_t sz, uint32_t
 	smsg.data = msg;
 	smsg.sz = sz | (size_t)type << MESSAGE_TYPE_SHIFT;
 
-	skynet_mq_push(ctx->queue, &smsg);
+	skynet_context_push(ctx->handle, &smsg);
 }
 
 void 
@@ -813,22 +791,40 @@ skynet_globalinit(void) {
 		fprintf(stderr, "pthread_key_create failed");
 		exit(1);
 	}
+	if (pthread_key_create(&G_NODE.thread_id, NULL)) {
+		fprintf(stderr, "pthread_key_create failed");
+		exit(1);
+	}
 	// set mainthread's key
-	skynet_initthread(THREAD_MAIN);
+	skynet_initthread(THREAD_MAIN, MAIN_THREAD_ID);
 }
 
 void 
 skynet_globalexit(void) {
 	pthread_key_delete(G_NODE.handle_key);
+	pthread_key_delete(G_NODE.thread_id);
 }
 
 void
-skynet_initthread(int m) {
+skynet_initthread(int m, int thread_id) {
 	uintptr_t v = (uint32_t)(-m);
+	uintptr_t v1 = (uint32_t)(thread_id);
 	pthread_setspecific(G_NODE.handle_key, (void *)v);
+	pthread_setspecific(G_NODE.thread_id, (void *)v1);
 }
 
 void
 skynet_profile_enable(int enable) {
 	G_NODE.profile = (bool)enable;
+}
+
+int
+skynet_context_qid(struct skynet_context *ctx) {
+	return ctx->qid;
+}
+
+int
+skynet_thread_id() {
+	void* v = pthread_getspecific(G_NODE.thread_id);
+	return (uint32_t)(uintptr_t)v;
 }

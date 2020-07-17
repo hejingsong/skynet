@@ -6,6 +6,7 @@
 
 struct skynet_message {
 	uint32_t source;
+	uint32_t dest;
 	int session;
 	void * data;
 	size_t sz;
@@ -37,5 +38,10 @@ int skynet_mq_length(struct message_queue *q);
 int skynet_mq_overload(struct message_queue *q);
 
 void skynet_mq_init();
+
+void skynet_multi_queue_init(int num);
+int skynet_multi_queue_size();
+int skynet_multi_queue_pop(int row, int col, struct skynet_message* msg);
+void skynet_multi_queue_push(int row, int col, struct skynet_message* msg);
 
 #endif
